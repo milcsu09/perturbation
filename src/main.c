@@ -7,17 +7,17 @@
 
 #include "thread-pool.h"
 
-// #define WIDTH  800
-// #define HEIGHT 600
-#define WIDTH 1600
-#define HEIGHT 900
+#define WIDTH  800
+#define HEIGHT 600
+// #define WIDTH 1600
+// #define HEIGHT 900
 // #define WIDTH  1920
 // #define HEIGHT 1080
 
 #define PRECISION_BITS 1024
 #define ESCAPE_RADIUS 1e6
 
-static int max_iter = 4096;
+static int max_iter = 64;
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
@@ -28,6 +28,7 @@ static atomic_bool g_orbit_ready;
 
 static double *g_orbit_re;
 static double *g_orbit_im;
+static atomic_int g_orbit_amount;
 
 static uint32_t pixels[WIDTH * HEIGHT];
 static pthread_mutex_t pixels_mutex;
@@ -127,6 +128,7 @@ render_compute_orbit_thread (void *argument)
   pthread_mutex_lock (&pixels_mutex);
   memcpy (g_orbit_re, work->orbit_re, max_iter * sizeof (double));
   memcpy (g_orbit_im, work->orbit_im, max_iter * sizeof (double));
+  atomic_store (&g_orbit_amount, max_iter);
   atomic_store (&g_orbit_ready, 1);
   pthread_mutex_unlock (&pixels_mutex);
 
@@ -147,6 +149,7 @@ struct render_work
   double scale;
   double *orbit_re;
   double *orbit_im;
+  int orbit_amount;
   int generation;
 };
 
@@ -160,7 +163,8 @@ render_test (void *argument)
     0xFF000000, 0xFF1A0A5E, 0xFF3D1F99, 0xFF5C44C3, 0xFF7C68E5,
     0xFF9AA1F1, 0xFFB7BCFA, 0xFFDFE5FF, 0xFFB1C1D9, 0xFF7D91BF,
     0xFF4C65A7, 0xFF1F3D88, 0xFF0A1A5E,
-  };*/
+  };
+  */
 
   /*static const uint32_t palette[] = {
     0xBCCAB3,
@@ -294,7 +298,13 @@ render_test (void *argument)
                   delta_z_re = temp_re + dz2_re + delta_c_re;
                   delta_z_im = temp_im + dz2_im + delta_c_im;
 
-                  iter_orbit++;
+                  if (iter_orbit + 1 > work->orbit_amount - 1)
+                    {
+                      iter++;
+                      continue;
+                    }
+                  else
+                    iter_orbit++;
 
                   double z_re = work->orbit_re[iter_orbit] + delta_z_re;
                   double z_im = work->orbit_im[iter_orbit] + delta_z_im;
@@ -434,6 +444,10 @@ main (void)
   mpfr_t center_re, center_im, scale;
   mpfr_inits2 (PRECISION_BITS, center_re, center_im, scale, (mpfr_ptr)0);
 
+  // mpfr_set_str (center_re, "-1.985919359960978684453223192193245964271429062666543775386350473746671904875957384480865222226476313620202583817469956970852638701807169521470642552907749357586890444572682637018316051868610025537670443440689026879454018393007724172657727729167322909246742879556044470059151604019800566771833620747885755006452251", 10, MPFR_RNDN);
+
+  // mpfr_set_str (center_im, "-0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000678212430620458622491305267427423408887673261336189549931937020270202016632357548903502696479563088407759416804344221703369528195270240611711018734136689857005888", 10, MPFR_RNDN);
+
   mpfr_set_d (center_re, -0.75, MPFR_RNDN);
   mpfr_set_d (center_im, 0.00, MPFR_RNDN);
   mpfr_set_d (scale, 0.005, MPFR_RNDN);
@@ -475,6 +489,8 @@ main (void)
 
   uint32_t start, end;
 
+  uint8_t show_information = 0;
+
   while (1)
     {
       SDL_Event event;
@@ -487,6 +503,9 @@ main (void)
           case SDL_KEYDOWN:
             switch (event.key.keysym.sym)
               {
+              case SDLK_LALT:
+                show_information = !show_information;
+                break;
               case SDLK_PAGEUP:
                 atomic_fetch_add (&g_generation, 1);
                 thread_pool_clear (pool);
@@ -643,6 +662,9 @@ main (void)
 
       if (atomic_load (&g_orbit_ready))
         {
+          for (size_t i = 0; i < WIDTH * HEIGHT; ++i)
+            pixels[i] = 0;
+
           start = SDL_GetTicks ();
 
           computing_orbit = 0;
@@ -653,8 +675,14 @@ main (void)
           for (size_t i = 0; i < WIDTH * HEIGHT; ++i)
             pixels_done[i] = -1;
 
-          for (int step = 64; step >= 1; step /= 2)
+          const int steps[] = { 16, 4, 1 };
+          const int steps_amount = sizeof steps / sizeof (int);
+
+          // for (int step = 64; step != 1; step = 1)
+          for (int i = 0; i < steps_amount; ++i)
             {
+              int step = steps[i];
+
               int tile = step;
               if (tile < 8)
                 tile = 8;
@@ -674,6 +702,7 @@ main (void)
 
                     work->orbit_re = g_orbit_re;
                     work->orbit_im = g_orbit_im;
+                    work->orbit_amount = atomic_load (&g_orbit_amount);
 
                     work->scale = mpfr_get_d (scale, MPFR_RNDN);
 
@@ -744,7 +773,7 @@ main (void)
 
       SDL_RenderCopy (renderer, texture, NULL, &vr);
 
-      if (computing_orbit)
+      if (computing_orbit && show_information)
         {
           uint32_t end_orbit = SDL_GetTicks ();
           uint32_t time_orbit = end_orbit - start_orbit;
@@ -753,11 +782,29 @@ main (void)
           snprintf (buffer, sizeof buffer, "Computing orbit ... (%dms)",
                     time_orbit);
 
+          SDL_Rect rect = { 20, (HEIGHT - 24) - 20, 0, 0 };
+          SDL_Texture *text = render_text (renderer, font, buffer,
+                                           (SDL_Color){ 255, 255, 255, 255 },
+                                           &rect.w, &rect.h);
+
+          SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+          SDL_RenderFillRect(renderer, &rect);
+          SDL_RenderCopy (renderer, text, NULL, &rect);
+        }
+
+      if (show_information)
+        {
+          char buffer[120];
+          snprintf (buffer, sizeof buffer, "Zoom: %.2e",
+                    mpfr_get_d (scale, MPFR_RNDN));
+
           SDL_Rect rect = { 20, 20, 0, 0 };
           SDL_Texture *text = render_text (renderer, font, buffer,
                                            (SDL_Color){ 255, 255, 255, 255 },
                                            &rect.w, &rect.h);
 
+          SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+          SDL_RenderFillRect(renderer, &rect);
           SDL_RenderCopy (renderer, text, NULL, &rect);
         }
 

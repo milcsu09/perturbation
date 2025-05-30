@@ -15,34 +15,52 @@
 // #define HEIGHT 1080
 
 #define PRECISION_BITS 1024
-#define ESCAPE_RADIUS  1e6
+#define ESCAPE_RADIUS 1e6
 
 static int max_iter = 4096;
 
-static SDL_Window   *window;
+static SDL_Window *window;
 static SDL_Renderer *renderer;
-static SDL_Texture  *texture;
+static SDL_Texture *texture;
 
-static atomic_int  g_generation;
+static atomic_int g_generation;
 static atomic_bool g_orbit_ready;
 
 static double *g_orbit_re;
 static double *g_orbit_im;
 
-static uint32_t        pixels[WIDTH * HEIGHT];
+static uint32_t pixels[WIDTH * HEIGHT];
 static pthread_mutex_t pixels_mutex;
 
-static int64_t         pixels_done[WIDTH * HEIGHT];
+static int64_t pixels_done[WIDTH * HEIGHT];
 static pthread_mutex_t pixels_done_mutex;
+
+static inline uint32_t
+interpolate_color (uint32_t c1, uint32_t c2, double frac)
+{
+  uint8_t r1 = (c1 >> 16) & 0xFF;
+  uint8_t g1 = (c1 >> 8) & 0xFF;
+  uint8_t b1 = c1 & 0xFF;
+
+  uint8_t r2 = (c2 >> 16) & 0xFF;
+  uint8_t g2 = (c2 >> 8) & 0xFF;
+  uint8_t b2 = c2 & 0xFF;
+
+  uint8_t r = (1.0f - frac) * r1 + frac * r2;
+  uint8_t g = (1.0f - frac) * g1 + frac * g2;
+  uint8_t b = (1.0f - frac) * b1 + frac * b2;
+
+  return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
 
 struct orbit_work
 {
-  mpfr_t  center_re;
-  mpfr_t  center_im;
-  double  scale;
+  mpfr_t center_re;
+  mpfr_t center_im;
+  double scale;
   double *orbit_re;
   double *orbit_im;
-  int     generation;
+  int generation;
 };
 
 void
@@ -107,8 +125,8 @@ render_compute_orbit_thread (void *argument)
     goto clean;
 
   pthread_mutex_lock (&pixels_mutex);
-  memcpy (g_orbit_re, work->orbit_re, max_iter * sizeof(double));
-  memcpy (g_orbit_im, work->orbit_im, max_iter * sizeof(double));
+  memcpy (g_orbit_re, work->orbit_re, max_iter * sizeof (double));
+  memcpy (g_orbit_im, work->orbit_im, max_iter * sizeof (double));
   atomic_store (&g_orbit_ready, 1);
   pthread_mutex_unlock (&pixels_mutex);
 
@@ -121,15 +139,15 @@ clean:
 
 struct render_work
 {
-  int     x;
-  int     y;
-  int     tile;
-  int     step;
-  int     samples;
-  double  scale;
+  int x;
+  int y;
+  int tile;
+  int step;
+  int samples;
+  double scale;
   double *orbit_re;
   double *orbit_im;
-  int     generation;
+  int generation;
 };
 
 void
@@ -154,6 +172,16 @@ render_test (void *argument)
     0x1F2A22
   };*/
 
+  static const uint32_t palette[]
+      = { 0xFF000000, 0xFF7877EE, 0xFF180719, 0xFFC5421C, 0xFF1D120B,
+          0xFF872E47, 0xFF181B0D, 0xFFF1E680, 0xFF111F18, 0xFFF0A28B,
+          0xFF0B041E, 0xFF6A57BD, 0xFF1D150E, 0xFF0C8C76, 0xFF0A061D,
+          0xFF32904D, 0xFF160018, 0xFF94BCF3, 0xFF042007, 0xFFE7920E,
+          0xFF0A0D14, 0xFFB89344, 0xFF0D1C03, 0xFFA9F898, 0xFF040022,
+          0xFF3E5330, 0xFF071516, 0xFF9861B8, 0xFF08030C, 0xFFF75CEB,
+          0xFF1F2010 };
+
+  /*
   static const uint32_t palette[] = {
     0xa9391f,
     0xa68921,
@@ -200,7 +228,7 @@ render_test (void *argument)
     // 0xac446c,
     0x0b1405,
   };
-
+  */
 
   static const int palette_size = sizeof (palette) / sizeof (palette[0]);
 
@@ -237,7 +265,58 @@ render_test (void *argument)
           double delta_z_re = 0.0;
           double delta_z_im = 0.0;
 
-          int iter = 0;
+          // int iter = 0;
+          int iter;
+          double zn2;
+
+          pthread_mutex_lock (&pixels_done_mutex);
+          iter = pixels_done[y * WIDTH + x];
+          pthread_mutex_unlock (&pixels_done_mutex);
+
+          if (iter == -1)
+            {
+              int iter_orbit = 0;
+
+              while (iter < max_iter)
+                {
+                  double ref_re = work->orbit_re[iter_orbit];
+                  double ref_im = work->orbit_im[iter_orbit];
+
+                  double temp_re
+                      = 2.0 * (ref_re * delta_z_re - ref_im * delta_z_im);
+                  double temp_im
+                      = 2.0 * (ref_re * delta_z_im + ref_im * delta_z_re);
+
+                  double dz2_re
+                      = delta_z_re * delta_z_re - delta_z_im * delta_z_im;
+                  double dz2_im = 2.0 * delta_z_re * delta_z_im;
+
+                  delta_z_re = temp_re + dz2_re + delta_c_re;
+                  delta_z_im = temp_im + dz2_im + delta_c_im;
+
+                  iter_orbit++;
+
+                  double z_re = work->orbit_re[iter_orbit] + delta_z_re;
+                  double z_im = work->orbit_im[iter_orbit] + delta_z_im;
+
+                  if (z_re * z_re + z_im * z_im > escape_radius_sq)
+                    break;
+
+                  zn2 = z_re * z_re + z_im * z_im;
+
+                  if ((delta_z_re * delta_z_re + delta_z_im * delta_z_im)
+                      > (z_re * z_re + z_im * z_im))
+                    {
+                      delta_z_re = z_re;
+                      delta_z_im = z_im;
+                      iter_orbit = 0;
+                    }
+
+                  iter++;
+                }
+            }
+
+          /*
           int iter_orbit = 0;
 
           while (iter < max_iter)
@@ -274,6 +353,7 @@ render_test (void *argument)
 
               iter++;
             }
+          */
 
           uint32_t color;
 
@@ -281,26 +361,20 @@ render_test (void *argument)
             color = 0xFF000000;
           else
             {
-              float t = (float)(iter % palette_size) + ((float)(iter % 1));
+              double nu = iter + 1 - log2 (log2 (sqrt (zn2)));
 
-              float freq = 0.1f;
-              t = (float)(iter * freq);
-              t = t - floorf (t / palette_size) * palette_size;
+              double freq = 0.1;
+              double t = nu * freq;
+
+              t = t - floor (t / palette_size) * palette_size;
 
               int idx = (int)t;
-              float frac = t - idx;
+              double frac = t - idx;
 
               uint32_t c1 = palette[idx % palette_size];
               uint32_t c2 = palette[(idx + 1) % palette_size];
 
-              uint8_t r = ((1 - frac) * ((c1 >> 16) & 0xFF))
-                          + (frac * ((c2 >> 16) & 0xFF));
-              uint8_t g = ((1 - frac) * ((c1 >> 8) & 0xFF))
-                          + (frac * ((c2 >> 8) & 0xFF));
-              uint8_t b = ((1 - frac) * (c1 & 0xFF))
-                                    + (frac * (c2 & 0xFF));
-
-              color = 0xFF000000 | (r << 16) | (g << 8) | b;
+              color = interpolate_color (c1, c2, frac);
             }
 
           pthread_mutex_lock (&pixels_mutex);
@@ -320,123 +394,6 @@ render_test (void *argument)
             }
 
           pthread_mutex_unlock (&pixels_mutex);
-
-          /*
-          float r_total = 0;
-          float g_total = 0;
-          float b_total = 0;
-
-          for (int i = 0; i < samples; ++i)
-            {
-              double offset_x = ((double)rand () / RAND_MAX) - 0.5;
-              double offset_y = ((double)rand () / RAND_MAX) - 0.5;
-
-              double dx = (x + offset_x - WIDTH / 2.0) * scale;
-              double dy = (y + offset_y - HEIGHT / 2.0) * scale;
-
-              double delta_c_re = dx;
-              double delta_c_im = dy;
-              double delta_z_re = 0.0;
-              double delta_z_im = 0.0;
-
-              int iter = 0;
-              int iter_orbit = 0;
-
-              while (iter < max_iter)
-                {
-                  double ref_re = work->orbit_re[iter_orbit];
-                  double ref_im = work->orbit_im[iter_orbit];
-
-                  double temp_re
-                      = 2.0 * (ref_re * delta_z_re - ref_im * delta_z_im);
-                  double temp_im
-                      = 2.0 * (ref_re * delta_z_im + ref_im * delta_z_re);
-
-                  double dz2_re = delta_z_re * delta_z_re - delta_z_im * delta_z_im;
-                  double dz2_im = 2.0 * delta_z_re * delta_z_im;
-
-                  delta_z_re = temp_re + dz2_re + delta_c_re;
-                  delta_z_im = temp_im + dz2_im + delta_c_im;
-
-                  iter_orbit++;
-
-                  double z_re = work->orbit_re[iter_orbit] + delta_z_re;
-                  double z_im = work->orbit_im[iter_orbit] + delta_z_im;
-
-                  if (z_re * z_re + z_im * z_im > escape_radius_sq)
-                    break;
-
-                  if ((delta_z_re * delta_z_re + delta_z_im * delta_z_im)
-                      > (z_re * z_re + z_im * z_im))
-                    {
-                      delta_z_re = z_re;
-                      delta_z_im = z_im;
-                      iter_orbit = 0;
-                    }
-
-                  iter++;
-                }
-
-              // uint32_t color;
-
-              if (iter == max_iter)
-                {
-                  r_total += 0;
-                  g_total += 0;
-                  b_total += 0;
-                }
-                // color = 0xFF000000;
-              else
-                {
-                  float t = (float)(iter % palette_size) + ((float)(iter % 1));
-
-                  float freq = 0.1f; // .1
-                  t = (float)(iter * freq);
-                  t = t - floorf (t / palette_size) * palette_size;
-
-                  int idx = (int)t;
-                  float frac = t - idx;
-
-                  uint32_t c1 = palette[idx % palette_size];
-                  uint32_t c2 = palette[(idx + 1) % palette_size];
-
-                  uint8_t r = (uint8_t)(((1 - frac) * ((c1 >> 16) & 0xFF))
-                                        + (frac * ((c2 >> 16) & 0xFF)));
-                  uint8_t g = (uint8_t)(((1 - frac) * ((c1 >> 8) & 0xFF))
-                                        + (frac * ((c2 >> 8) & 0xFF)));
-                  uint8_t b = (uint8_t)(((1 - frac) * (c1 & 0xFF))
-                                        + (frac * (c2 & 0xFF)));
-
-                  r_total += r;
-                  g_total += g;
-                  b_total += b;
-                  // color = 0xFF000000 | (r << 16) | (g << 8) | b;
-                }
-            }
-
-          uint8_t r = (uint8_t)(r_total / samples);
-          uint8_t g = (uint8_t)(g_total / samples);
-          uint8_t b = (uint8_t)(b_total / samples);
-          uint32_t color = 0xFF000000 | (r << 16) | (g << 8) | b;
-
-          pthread_mutex_lock (&pixels_mutex);
-
-          for (int step_y = 0; step_y < work->step; ++step_y)
-            {
-              if (y + step_y >= HEIGHT)
-                break;
-
-              for (int step_x = 0; step_x < work->step; ++step_x)
-                {
-                  if (x + step_x >= WIDTH)
-                    break;
-
-                  pixels[(y + step_y) * WIDTH + (x + step_x)] = color;
-                }
-            }
-
-          pthread_mutex_unlock (&pixels_mutex);
-          */
         }
     }
 
@@ -445,16 +402,16 @@ clean:
 }
 
 SDL_Texture *
-render_text(SDL_Renderer *renderer, TTF_Font *font, const char *text, SDL_Color color,
-            int *out_width, int *out_height)
+render_text (SDL_Renderer *renderer, TTF_Font *font, const char *text,
+             SDL_Color color, int *out_width, int *out_height)
 {
-  SDL_Surface *surface = TTF_RenderText_Blended(font, text, color);
-  SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+  SDL_Surface *surface = TTF_RenderText_Blended (font, text, color);
+  SDL_Texture *texture = SDL_CreateTextureFromSurface (renderer, surface);
 
   *out_width = surface->w;
   *out_height = surface->h;
 
-  SDL_FreeSurface(surface);
+  SDL_FreeSurface (surface);
   return texture;
 }
 
@@ -496,14 +453,14 @@ main (void)
   int redraw = 1;
 
   TTF_Font *font = TTF_OpenFont ("font.ttf", 24);
-  SDL_Color color = {255, 255, 255, 255};
+  SDL_Color color = { 255, 255, 255, 255 };
 
   /*SDL_Texture *text_orbit;
   SDL_Rect dst_orbit = { 10, 10, 0, 0 };
 
   {
-    SDL_Surface *surface = TTF_RenderText_Blended (font, "Computing orbit...", color);
-    text_orbit = SDL_CreateTextureFromSurface (renderer, surface);
+    SDL_Surface *surface = TTF_RenderText_Blended (font, "Computing orbit...",
+  color); text_orbit = SDL_CreateTextureFromSurface (renderer, surface);
     SDL_FreeSurface (surface);
 
     SDL_QueryTexture (text_orbit, NULL, NULL, &dst_orbit.w, &dst_orbit.h);
@@ -609,8 +566,8 @@ main (void)
 
               mpfr_mul_d (scale, scale, zoom_value, MPFR_RNDN);
 
-              mpfr_clears (old_scale, new_scale, re_before, im_before,
-                           tmp1, tmp2, (mpfr_ptr)0);
+              mpfr_clears (old_scale, new_scale, re_before, im_before, tmp1,
+                           tmp2, (mpfr_ptr)0);
 
               redraw = 1;
             }
@@ -630,7 +587,7 @@ main (void)
 
           struct orbit_work *work;
 
-          work = calloc (1, sizeof(struct orbit_work));
+          work = calloc (1, sizeof (struct orbit_work));
           mpfr_inits2 (PRECISION_BITS, work->center_re, work->center_im,
                        (mpfr_ptr)0);
           mpfr_set (work->center_re, center_re, MPFR_RNDN);
@@ -638,8 +595,8 @@ main (void)
 
           work->scale = mpfr_get_d (scale, MPFR_RNDN);
           work->generation = atomic_load (&g_generation);
-          work->orbit_re = calloc (max_iter, sizeof(double));
-          work->orbit_im = calloc (max_iter, sizeof(double));
+          work->orbit_re = calloc (max_iter, sizeof (double));
+          work->orbit_im = calloc (max_iter, sizeof (double));
 
           thread_pool_enqueue (pool, render_compute_orbit_thread, work);
 
@@ -649,8 +606,8 @@ main (void)
           start = SDL_GetTicks ();
 
           uint32_t start_orbit = SDL_GetTicks ();
-          render_compute_orbit (center_re, center_im, orbit_re, orbit_im, atomic_load (&g_generation));
-          uint32_t end_orbit = SDL_GetTicks ();
+          render_compute_orbit (center_re, center_im, orbit_re, orbit_im,
+          atomic_load (&g_generation)); uint32_t end_orbit = SDL_GetTicks ();
           time_orbit = end_orbit - start_orbit;
 
           atomic_fetch_add (&g_generation, 1);
@@ -693,11 +650,15 @@ main (void)
           atomic_fetch_add (&g_generation, 1);
           thread_pool_clear (pool);
 
+          for (size_t i = 0; i < WIDTH * HEIGHT; ++i)
+            pixels_done[i] = -1;
+
           for (int step = 64; step >= 1; step /= 2)
             {
               int tile = step;
               if (tile < 8)
                 tile = 8;
+
               for (int y = 0; y < HEIGHT; y += tile)
                 for (int x = 0; x < WIDTH; x += tile)
                   {
@@ -725,7 +686,8 @@ main (void)
           atomic_store (&g_orbit_ready, 0);
         }
 
-      if (!done && !computing_orbit && thread_pool_get_threads_active (pool) == 0)
+      if (!done && !computing_orbit
+          && thread_pool_get_threads_active (pool) == 0)
         {
           done = 1;
 
@@ -777,12 +739,8 @@ main (void)
           SDL_RenderCopy (renderer, texture, NULL, NULL);
         }
 
-      SDL_Rect vr = {
-        (-zoom_x) * zoom_scale,
-        (-zoom_y) * zoom_scale,
-        WIDTH * zoom_scale,
-        HEIGHT * zoom_scale
-      };
+      SDL_Rect vr = { (-zoom_x) * zoom_scale, (-zoom_y) * zoom_scale,
+                      WIDTH * zoom_scale, HEIGHT * zoom_scale };
 
       SDL_RenderCopy (renderer, texture, NULL, &vr);
 
@@ -795,10 +753,10 @@ main (void)
           snprintf (buffer, sizeof buffer, "Computing orbit ... (%dms)",
                     time_orbit);
 
-          SDL_Rect rect = {20, 20, 0, 0};
-          SDL_Texture *text =
-            render_text (renderer, font, buffer, (SDL_Color){ 255, 255, 255, 255 },
-                       &rect.w, &rect.h);
+          SDL_Rect rect = { 20, 20, 0, 0 };
+          SDL_Texture *text = render_text (renderer, font, buffer,
+                                           (SDL_Color){ 255, 255, 255, 255 },
+                                           &rect.w, &rect.h);
 
           SDL_RenderCopy (renderer, text, NULL, &rect);
         }
